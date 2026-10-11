@@ -90,6 +90,17 @@ class Timer(object):
                 self._restored_end_time += seconds
         await self.changed()
 
+    async def set_remaining(self, seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0:
+            raise ValueError("Remaining time must be a non-negative integer in seconds")
+        if self.running:
+            self.end_time = int(time.time()) + seconds
+        else:
+            self._timemout = seconds
+            if self._restored_end_time is not None:
+                self._restored_end_time = int(time.time()) + seconds
+        await self.changed()
+
     def start(self):
         if self.running:
             return

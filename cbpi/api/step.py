@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from abc import abstractmethod
 
 import cbpi
@@ -91,6 +92,48 @@ class CBPiStep(CBPiBase):
 
     async def on_recovery(self):
         pass
+
+    async def adjust_timer_remaining(self, minutes=None, subtract_seconds=0):
+        from cbpi.api.dataclasses import NotificationType
+
+        step = self.cbpi.step.find_by_id(self.id)
+        if step is None or step.instance is not self or step.status not in (
+            StepState.ACTIVE, StepState.STOP
+        ):
+            self.cbpi.notify(
+                self.name, "Start the step before changing its remaining time.",
+                NotificationType.WARNING,
+            )
+            return
+        seconds = None
+        if minutes is not None:
+            try:
+                if isinstance(minutes, bool):
+                    raise ValueError("Boolean time is not valid")
+                value = float(minutes)
+                if not math.isfinite(value) or value < 0 or not math.isfinite(value * 60):
+                    raise ValueError("Invalid remaining time")
+                seconds = round(value * 60)
+            except (TypeError, ValueError, OverflowError):
+                self.cbpi.notify(
+                    self.name, "Enter a finite, non-negative remaining time in minutes.",
+                    NotificationType.WARNING,
+                )
+                return
+        if self.timer is None:
+            self.timer = self.create_timer()
+        if seconds is None:
+            seconds = max(0, self.timer.remaining() - subtract_seconds)
+        await self.timer.set_remaining(seconds)
+        if seconds == 0:
+            self.timer.started = True
+        await self.on_timer_update(self.timer, seconds)
+        self.recovery_state = self.get_timer_state()
+        await self.save_props()
+        self.cbpi.notify(
+            self.name, "Remaining time set to %s" % self.timer.get_time(),
+            NotificationType.INFO,
+        )
 
     def _done(self, task):
         if self._done_callback is not None:

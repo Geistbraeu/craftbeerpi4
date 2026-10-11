@@ -206,6 +206,19 @@ class MashStep(CBPiStep):
 
     timer_recovery = True
 
+    @action("Subtract 5 Minutes from Timer", [])
+    async def subtract_timer(self):
+        await self.adjust_timer_remaining(subtract_seconds=300)
+
+    @action("Set Remaining Time", [
+        Property.Number(label="minutes", configurable=True, description="Remaining time in minutes"),
+    ])
+    async def set_remaining_timer(self, minutes=None):
+        if minutes is None:
+            self.cbpi.notify(self.name, "Enter remaining time in minutes.", NotificationType.WARNING)
+            return
+        await self.adjust_timer_remaining(minutes=minutes)
+
     @action("Start Timer", [])
     async def start_timer(self):
         if not self.running or self.timer is None:
@@ -523,6 +536,19 @@ class ActorStep(CBPiStep):
 class BoilStep(CBPiStep):
 
     timer_recovery = True
+
+    @action("Subtract 5 Minutes from Timer", [])
+    async def subtract_timer(self):
+        await self.adjust_timer_remaining(subtract_seconds=300)
+
+    @action("Set Remaining Time", [
+        Property.Number(label="minutes", configurable=True, description="Remaining time in minutes"),
+    ])
+    async def set_remaining_timer(self, minutes=None):
+        if minutes is None:
+            self.cbpi.notify(self.name, "Enter remaining time in minutes.", NotificationType.WARNING)
+            return
+        await self.adjust_timer_remaining(minutes=minutes)
 
     def restore_timer_state(self, state, count_downtime=False, keep_deadline=False):
         hops = state.get("hops_added", [False] * 6) if isinstance(state, dict) else None

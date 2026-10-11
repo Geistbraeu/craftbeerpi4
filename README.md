@@ -55,6 +55,14 @@ and a warning. Timer execution state is not exported into recipes and is cleared
 on reset or when loading a different recipe. Fermentation and third-party steps
 do not opt into this timer recovery mechanism.
 
+MashStep and BoilStep also offer **Subtract 5 Minutes from Timer** and
+**Set Remaining Time** (minutes, including fractional minutes). These actions
+work on active or paused steps, including while waiting for temperature, without
+starting a paused timer or changing the recipe duration. Subtraction clamps at
+zero; negative or non-finite input is rejected. Changes are saved immediately.
+An active countdown reaching zero completes normally; a paused step with zero
+remaining time finishes only after Start is pressed.
+
 ## 🧑‍🤝‍🧑 Contribute
 You want to help develop CraftBeerPi4? To get you quickly stated, this repository comes with a preconfigured
 development environment. To be able to use this environment you need 2 things installed on your computer:

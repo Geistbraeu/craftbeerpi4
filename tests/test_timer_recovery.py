@@ -11,6 +11,7 @@ from cbpi.api.dataclasses import Props, Step
 from cbpi.api.step import CBPiStep, StepResult, StepState
 from cbpi.api.timer import Timer
 from cbpi.controller.recipe_controller import RecipeController
+from cbpi.controller.plugin_controller import PluginController
 from cbpi.controller.step_controller import StepController
 from cbpi.extension.mashstep import ActorStep, BoilStep, MashStep, WaitStep
 
@@ -43,6 +44,24 @@ class RecoveryTestStep(CBPiStep):
 
 
 class TimerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_set_remaining_updates_deadline_and_preserves_recipe_duration(self):
+        timer = Timer(3600)
+        with patch("cbpi.api.timer.time.time", return_value=1000):
+            timer.start()
+            await timer.set_remaining(120)
+            self.assertEqual(timer.end_time, 1120)
+            await timer.stop()
+            self.assertEqual(timer.remaining(), 120)
+            await timer.set_remaining(600)
+            self.assertFalse(timer.running)
+            self.assertEqual(timer.remaining(), 600)
+            self.assertEqual(timer.timeout, 3600)
+            timer.reset()
+            self.assertEqual(timer.remaining(), 3600)
+        for invalid in (-1, 1.5, True, float("nan")):
+            with self.assertRaises(ValueError):
+                await timer.set_remaining(invalid)
+
     async def test_stop_preserves_adjustments_and_never_completes_step(self):
         done = AsyncMock()
         timer = Timer(600, on_done=done)
@@ -111,6 +130,105 @@ class TimerRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StepRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def adjustment_step(self, cls, status=StepState.STOP):
+        instance = cls(self.cbpi, "adjust", "Adjustment", Props({"Timer": 60}), None)
+        step = Step(
+            "adjust", instance.name, instance.props, cls.__name__,
+            status=status, instance=instance,
+        )
+        self.controller.profile = [step]
+        return step
+
+    async def test_adjustment_buttons_registered_for_mash_and_boil(self):
+        parser = PluginController(self.cbpi)
+        for cls in (MashStep, BoilStep):
+            actions = parser._parse_step_props(cls, cls.__name__)["actions"]
+            methods = {action["method"]: action for action in actions}
+            self.assertIn("subtract_timer", methods)
+            self.assertEqual(methods["set_remaining_timer"]["parameters"][0]["label"], "minutes")
+            self.assertEqual(methods["set_remaining_timer"]["parameters"][0]["type"], "number")
+
+    async def test_paused_adjustments_save_without_starting_or_changing_recipe(self):
+        for cls in (MashStep, BoilStep):
+            with self.subTest(step=cls.__name__):
+                step = self.adjustment_step(cls)
+                await self.controller.call_action(
+                    step.id, "set_remaining_timer", {"minutes": "20.5"}
+                )
+                self.assertEqual(step.instance.timer.remaining(), 1230)
+                self.assertFalse(step.instance.timer.running)
+                self.assertEqual(step.status, StepState.STOP)
+                self.assertEqual(step.props.get("Timer"), 60)
+                await self.controller.call_action(step.id, "subtract_timer", {})
+                self.assertEqual(step.instance.timer.remaining(), 930)
+                self.assertEqual(step.instance.summary, "00:15:30")
+                with open(self.path) as file:
+                    saved = json.load(file)["steps"][0]
+                self.assertEqual(saved["timer_state"]["remaining_seconds"], 930)
+                self.assertEqual(saved["status"], "S")
+                restored = cls(self.cbpi, step.id, step.name, step.props, None)
+                restored.restore_timer_state(saved["timer_state"])
+                self.assertEqual(restored.timer.remaining(), 930)
+                self.assertFalse(restored.timer.running)
+                if cls is BoilStep:
+                    self.assertEqual(step.instance.remaining_seconds, 930)
+                self.cbpi.equipment_started.assert_not_called()
+
+    async def test_active_adjustment_updates_end_time_and_expiry_once(self):
+        for cls in (MashStep, BoilStep):
+            with self.subTest(step=cls.__name__):
+                step = self.adjustment_step(cls, StepState.ACTIVE)
+                timer = step.instance.create_timer()
+                step.instance.timer = timer
+                timer._callback = AsyncMock()
+                with patch("cbpi.api.timer.time.time", return_value=1000):
+                    timer.start()
+                    await step.instance.set_remaining_timer(minutes=2)
+                    self.assertEqual(timer.end_time, 1120)
+                    await step.instance.subtract_timer()
+                    self.assertEqual(timer.remaining(), 0)
+                    self.assertEqual(step.instance.summary, "00:00:00")
+                    with open(self.path) as file:
+                        self.assertEqual(json.load(file)["steps"][0]["timer_state"]["end_time"], 1000)
+                    await asyncio.wait_for(timer._task, 2)
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    timer._callback.assert_awaited_once()
+
+    async def test_invalid_adjustment_leaves_timer_unchanged(self):
+        for cls in (MashStep, BoilStep):
+            step = self.adjustment_step(cls)
+            await step.instance.set_remaining_timer(minutes=20)
+            for invalid in (None, "", "wrong", -1, True, float("inf"), float("nan"), 1e308):
+                with self.subTest(step=cls.__name__, value=invalid):
+                    self.cbpi.notify.reset_mock()
+                    await step.instance.set_remaining_timer(minutes=invalid)
+                    self.assertEqual(step.instance.timer.remaining(), 1200)
+                    self.assertEqual(self.cbpi.notify.call_args.args[2].value, "warning")
+
+    async def test_initial_and_done_steps_reject_adjustments(self):
+        for status in (StepState.INITIAL, StepState.DONE):
+            for cls in (MashStep, BoilStep):
+                step = self.adjustment_step(cls, status)
+                await step.instance.subtract_timer()
+                await step.instance.set_remaining_timer(minutes=10)
+                self.assertIsNone(step.instance.timer)
+                self.assertEqual(step.status, status)
+
+    async def test_zero_paused_adjustment_waits_for_resume_and_skips_equipment(self):
+        for cls in (MashStep, BoilStep):
+            step = self.adjustment_step(cls)
+            await step.instance.set_remaining_timer(minutes=2)
+            await step.instance.subtract_timer()
+            self.assertEqual(step.instance.timer.remaining(), 0)
+            self.assertFalse(step.instance.timer.running)
+            self.assertEqual(step.status, StepState.STOP)
+            self.assertEqual(step.instance.summary, "00:00:00")
+            await step.instance.start()
+            await step.instance.task
+            self.assertEqual(step.instance.cancel_reason, StepResult.NEXT)
+            self.cbpi.equipment_started.assert_not_called()
+
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
