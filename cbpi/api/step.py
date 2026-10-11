@@ -4,6 +4,7 @@ from abc import abstractmethod
 
 import cbpi
 from cbpi.api.base import CBPiBase
+from cbpi.api.timer import Timer
 
 __all__ = ["StepResult", "StepState", "StepMove", "CBPiStep", "CBPiFermentationStep"]
 
@@ -38,6 +39,8 @@ class StepMove(Enum):
 
 class CBPiStep(CBPiBase):
 
+    timer_recovery = False
+
     def __init__(self, cbpi, id, name, props, on_done) -> None:
         self.name = name
         self.cbpi = cbpi
@@ -51,11 +54,48 @@ class CBPiStep(CBPiBase):
         self.task = None
         self.running: bool = False
         self.logger = logging.getLogger(__name__)
+        self.recovery_state = None
+
+    def create_timer(self):
+        return Timer(
+            int(self.props.get("Timer", 0)) * 60,
+            on_update=self.on_timer_update,
+            on_done=self.on_timer_done,
+            on_change=self.save_props,
+        )
+
+    def get_timer_state(self):
+        if not self.timer_recovery or self.timer is None:
+            return None
+        return self.timer.snapshot()
+
+    def restore_timer_state(self, state, count_downtime=False, keep_deadline=False):
+        if not isinstance(state, dict):
+            raise ValueError("Invalid timer state")
+        if not isinstance(state.get("started"), bool):
+            raise ValueError("Invalid timer started flag")
+        for key in ("remaining_seconds", "saved_at"):
+            value = state.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("Invalid timer %s" % key)
+        deadline = state.get("end_time")
+        if deadline is not None and (
+            isinstance(deadline, bool) or not isinstance(deadline, int)
+            or deadline < 0
+        ):
+            raise ValueError("Invalid timer end_time")
+        self.recovery_state = state
+        self.timer = self.create_timer()
+        self.timer.restore(state, count_downtime, keep_deadline)
+        self.summary = self.timer.get_time() if self.timer.started else "Waiting for Target Temp"
+
+    async def on_recovery(self):
+        pass
 
     def _done(self, task):
         if self._done_callback is not None:
             try:
-                result = task.result()
+                result = self.cancel_reason if task.cancelled() else task.result()
                 self._done_callback(self, result)
             except Exception as e:
                 self.logger.error(e)
@@ -70,7 +110,10 @@ class CBPiStep(CBPiBase):
         self.running = False
         self.cancel_reason = StepResult.NEXT
         self.task.cancel()
-        await self.task
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self):
         try:
@@ -78,7 +121,14 @@ class CBPiStep(CBPiBase):
             if self.task is not None and self.task.done() is False:
                 self.cancel_reason = StepResult.STOP
                 self.task.cancel()
-                await self.task
+                try:
+                    await self.task
+                except asyncio.CancelledError:
+                    pass
+                if self.timer_recovery and self.timer is not None:
+                    await self.timer.stop()
+                    self.recovery_state = self.get_timer_state()
+                    self.summary = self.timer.get_time()
         except Exception as e:
             logging.error(e)
 
@@ -101,14 +151,29 @@ class CBPiStep(CBPiBase):
         pass
 
     async def _run(self):
+        initializing = False
         try:
+            if self.recovery_state is not None:
+                await self.on_recovery()
+            if (
+                self.timer_recovery and self.timer is not None
+                and self.timer.started and self.timer.remaining() == 0
+            ):
+                self.cbpi.notify(self.name, "Step time elapsed while inactive")
+                self.cancel_reason = StepResult.NEXT
+                self.running = False
+                return self.cancel_reason
+            initializing = True
             await self.on_start()
+            if self.timer_recovery:
+                await self.save_props()
             await self.run()
             self.cancel_reason = StepResult.DONE
         except asyncio.CancelledError as e:
             pass
         finally:
-            await self.on_stop()
+            if initializing:
+                await self.on_stop()
 
         return self.cancel_reason
 

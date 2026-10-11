@@ -1,4 +1,5 @@
 import json
+import copy
 import logging
 import os.path
 import re
@@ -40,6 +41,10 @@ class RecipeController:
         return id
 
     async def save(self, name, data):
+        data = copy.deepcopy(data)
+        for step in data.get("steps", []):
+            step.pop("timer_state", None)
+            step["status"] = StepState.INITIAL.value
         path = self.cbpi.config_folder.get_recipe_file_by_id(name)
         logging.info(data)
         with open(path, "w") as file:

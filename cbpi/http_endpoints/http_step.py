@@ -4,6 +4,7 @@ from aiohttp import web
 from cbpi.api import *
 from cbpi.api.dataclasses import Props, Step
 from cbpi.controller.step_controller import StepController
+from cbpi.api.step import StepState
 
 
 class StepHttpEndpoints:
@@ -127,6 +128,9 @@ class StepHttpEndpoints:
         step = Step(
             id, data.get("name"), Props(data.get("props", {})), data.get("type")
         )
+        current = self.controller.find_by_id(id)
+        if current is not None and current.status == StepState.ACTIVE:
+            raise web.HTTPConflict(text="Stop the step before editing it")
         return web.json_response((await self.controller.update(step)).to_dict())
 
     @request_mapping(path="/{id}", method="DELETE", auth_required=False)

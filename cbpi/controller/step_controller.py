@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import os.path
+import tempfile
 from os import listdir
 from os.path import isfile, join
 
@@ -26,11 +27,83 @@ class StepController:
         self.basic_data = {}
         self.step = None
         self.types = {}
+        self.profile = []
+        self._save_lock = asyncio.Lock()
+        self._checkpoint_task = None
+        self._shutting_down = False
+        self._load_failed = False
         self.cbpi.app.on_cleanup.append(self.shutdown)
 
     async def init(self):
         logging.info("INIT STEP Controller")
-        self.load(startActive=True)
+        self.load()
+        await self.restore_steps()
+        self._checkpoint_task = asyncio.create_task(self._checkpoint_loop())
+
+    async def _checkpoint_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            if self.find_by_status(StepState.ACTIVE) is not None:
+                try:
+                    await self.save()
+                except OSError:
+                    # save() reports the error; keep trying subsequent checkpoints.
+                    continue
+
+    async def restore_steps(self):
+        automatic_steps = []
+        for step in self.profile:
+            if step.status not in (StepState.ACTIVE, StepState.STOP):
+                continue
+            was_active = step.status == StepState.ACTIVE
+            automatic = was_active and step.props.get("RecoveryMode", "Paused") == "Automatic"
+            supported = step.instance is not None and step.instance.timer_recovery
+            if supported and step.timer_state is not None:
+                try:
+                    step.instance.restore_timer_state(
+                        step.timer_state,
+                        count_downtime=was_active and step.props.get("RecoveryDowntime", "No") == "Yes",
+                        keep_deadline=automatic,
+                    )
+                except (ValueError, TypeError, KeyError) as error:
+                    self.logger.error("Invalid timer state for step %s: %s", step.id, error)
+                    self.cbpi.notify(
+                        step.name, "Invalid saved timer. Restore paused with original duration.",
+                        NotificationType.ERROR,
+                    )
+                    step.instance.timer = None
+                    step.instance.recovery_state = None
+                    step.timer_state = None
+                    automatic = False
+            elif supported:
+                self.cbpi.notify(
+                    step.name, "No saved timer remaining. Original duration will be used.",
+                    NotificationType.WARNING,
+                )
+                automatic = False
+            else:
+                automatic = False
+
+            step.status = StepState.STOP
+            if automatic:
+                automatic_steps.append(step)
+            else:
+                self.cbpi.notify(
+                    step.name, "Step restored paused. Press Start to continue.",
+                    NotificationType.INFO,
+                )
+        try:
+            await self.save()
+            for step in automatic_steps:
+                await self.start_step(step)
+            if automatic_steps:
+                await self.save()
+        except OSError:
+            for step in automatic_steps:
+                await step.instance.stop()
+                await step.instance.timer.stop()
+                step.status = StepState.STOP
+            raise
 
     def create(self, data):
 
@@ -47,10 +120,13 @@ class StepController:
         except Exception as e:
             logging.warning("Failed to create step instance %s - %s" % (id, e))
             instance = None
-        step = Step(id, name, type=type, status=status, instance=instance, props=props)
+        step = Step(
+            id, name, type=type, status=status, instance=instance, props=props,
+            timer_state=data.get("timer_state"),
+        )
         return step
 
-    def load(self, startActive=False):
+    def load(self):
 
         # create file if not exists
         if os.path.exists(self.path) is False:
@@ -58,39 +134,27 @@ class StepController:
             with open(self.path, "w") as file:
                 json.dump(dict(basic={}, steps=[]), file, indent=4, sort_keys=True)
 
-        # load from json file
         try:
             with open(self.path) as json_file:
                 data = json.load(json_file)
-                self.basic_data = data["basic"]
-                self.profile = data["steps"]
-
-            # Start step after start up
-            self.profile = list(map(lambda item: self.create(item), self.profile))
-            if startActive is True:
-                active_step = self.find_by_status("A")
-                if active_step is not None:
-                    asyncio.create_task(self.start_step(active_step))
-
-        except:
-            logging.warning("Invalid step_data.json file - Creating empty file")
-            os.remove(self.path)
-            with open(self.path, "w") as file:
-                json.dump(
-                    dict(basic={"name": ""}, steps=[]), file, indent=4, sort_keys=True
-                )
-
-            with open(self.path) as json_file:
-                data = json.load(json_file)
-                self.basic_data = data["basic"]
-                self.profile = data["steps"]
-
-            # Start step after start up
-            self.profile = list(map(lambda item: self.create(item), self.profile))
-            if startActive is True:
-                active_step = self.find_by_status("A")
-                if active_step is not None:
-                    asyncio.create_task(self.start_step(active_step))
+            if (
+                not isinstance(data, dict) or not isinstance(data.get("basic"), dict)
+                or not isinstance(data.get("steps"), list)
+                or any(not isinstance(item, dict) for item in data["steps"])
+            ):
+                raise ValueError("Invalid brewing profile structure")
+            profile = list(map(self.create, data["steps"]))
+            self.basic_data = data["basic"]
+            self.profile = profile
+            self._load_failed = False
+        except (OSError, ValueError, KeyError, TypeError):
+            self._load_failed = True
+            self.logger.exception("Cannot load brewing profile; file left unchanged")
+            self.cbpi.notify(
+                "Error", "Cannot load brewing profile. Check step_data.json.",
+                NotificationType.ERROR,
+            )
+            raise
 
     async def add(self, item: Step):
         logging.debug("Add step")
@@ -110,6 +174,9 @@ class StepController:
     async def update(self, item: Step):
 
         logging.info("update step")
+        old = self.find_by_id(item.id)
+        if old is not None and old.status == StepState.ACTIVE:
+            raise ValueError("Stop the step before editing it")
         try:
             type_cfg = self.types.get(item.type)
             clazz = type_cfg.get("class")
@@ -118,21 +185,65 @@ class StepController:
             logging.warning("Failed to create step instance %s - %s " % (item.id, e))
             item.instance = None
 
+        if old is not None and old.status == StepState.STOP and old.type == item.type:
+            item.status = old.status
+            item.timer_state = old.timer_state
+            if item.instance is not None and item.instance.timer_recovery and item.timer_state:
+                item.instance.restore_timer_state(item.timer_state)
         self.profile = list(
             map(lambda old: item if old.id == item.id else old, self.profile)
         )
         await self.save()
         return item
 
-    async def save(self):
-        logging.debug("save profile")
-        data = dict(
-            basic=self.basic_data,
-            steps=list(map(lambda item: item.to_dict(), self.profile)),
-        )
-        with open(self.path, "w") as file:
-            json.dump(data, file, indent=4, sort_keys=True)
+    async def save(self, refresh=True):
+        if self._load_failed:
+            raise ValueError("Refusing to overwrite a profile that failed to load")
+        if self._shutting_down and refresh:
+            return
+        async with self._save_lock:
+            if refresh:
+                for item in self.profile:
+                    if item.status in (StepState.ACTIVE, StepState.STOP):
+                        if item.instance is not None and item.instance.timer_recovery:
+                            item.timer_state = item.instance.get_timer_state()
+                    else:
+                        item.timer_state = None
+            data = dict(
+                basic=self.basic_data,
+                steps=list(map(lambda item: item.to_dict(), self.profile)),
+            )
+            self._write_profile(data)
         self.push_udpate()
+
+    def _write_profile(self, data):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=os.path.dirname(self.path), prefix=".step_data-",
+                suffix=".tmp", delete=False,
+            ) as file:
+                temporary = file.name
+                json.dump(data, file, indent=4, sort_keys=True, allow_nan=False)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.path)
+            if os.name == "posix":
+                directory = os.open(os.path.dirname(self.path), os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except (OSError, ValueError, TypeError):
+            self.logger.exception("Failed to save brewing profile")
+            self.cbpi.notify(
+                "Error", "Failed to save brewing profile. Timer recovery may be outdated.",
+                NotificationType.ERROR,
+            )
+            raise
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
 
     async def start(self):
 
@@ -289,28 +400,40 @@ class StepController:
 
     async def shutdown(self, app=None):
         logging.info("Mash Profile Shutdown")
-        for p in self.profile:
-            instance = p.instance
-            # Stopping all running task
-            if (
-                hasattr(instance, "task")
-                and instance.task != None
-                and instance.task.done() is False
-            ):
-                logging.info("Stop Step")
-                await instance.stop()
-                await instance.task
-        await self.save()
-        self.push_udpate()
+        if app is not None and self._checkpoint_task is not None:
+            self._checkpoint_task.cancel()
+            try:
+                await self._checkpoint_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await self.save()
+        finally:
+            self._shutting_down = True
+            try:
+                for p in self.profile:
+                    instance = p.instance
+                    if instance is not None and instance.task is not None and not instance.task.done():
+                        await instance.stop()
+            finally:
+                self._shutting_down = False
 
     def done(self, step, result):
         if result == StepResult.NEXT:
             step_current = self.find_by_id(step.id)
+            if (
+                self._shutting_down or step_current is None
+                or step_current.instance is not step
+            ):
+                return
             step_current.status = StepState.DONE
 
             async def wrapper():
+                if self._shutting_down or step_current not in self.profile:
+                    return
                 await self.save()
-                await self.start()
+                if not self._shutting_down and step_current in self.profile:
+                    await self.start()
 
             asyncio.create_task(wrapper())
 
@@ -370,30 +493,23 @@ class StepController:
             )
 
     async def load_recipe(self, data):
-        try:
-            await self.shutdown()
-        except:
-            pass
+        await self.shutdown()
 
         def add_runtime_data(item):
             item["status"] = "I"
             item["id"] = shortuuid.uuid()
+            item.pop("timer_state", None)
 
         list(map(lambda item: add_runtime_data(item), data.get("steps")))
-        with open(self.path, "w") as file:
-            json.dump(data, file, indent=4, sort_keys=True)
+        self._write_profile(data)
         self.load()
         self.push_udpate(complete=True)
 
     async def clear(self):
-        try:
-            await self.shutdown()
-        except:
-            pass
+        await self.shutdown()
 
         data = dict(basic=dict(), steps=[])
-        with open(self.path, "w") as file:
-            json.dump(data, file, indent=4, sort_keys=True)
+        self._write_profile(data)
 
         self.load()
         self.push_udpate(complete=True)
@@ -407,6 +523,9 @@ class StepController:
             basic=self.basic_data,
             steps=list(map(lambda item: item.to_dict(), self.profile)),
         )
+        for step in data["steps"]:
+            step.pop("timer_state", None)
+            step["status"] = StepState.INITIAL.value
         with open(path, "w") as file:
             yaml.dump(data, file)
         self.push_udpate()

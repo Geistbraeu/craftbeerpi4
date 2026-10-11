@@ -174,6 +174,7 @@ class Step:
     type: str = None
     status: StepState = StepState.INITIAL
     instance: str = None
+    timer_state: dict = None
 
     def __str__(self):
         return "name={} props={}, type={}, instance={}".format(
@@ -196,6 +197,7 @@ class Step:
             type=self.type,
             status=self.status.value,
             props=self.props.to_dict(),
+            timer_state=self.timer_state,
         )
 
 

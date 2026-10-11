@@ -314,10 +314,10 @@ class CraftBeerPi:
         self.plugin.load_plugins_from_evn()
         await self.fermenter.init()
         await self.sensor.init()
-        await self.step.init()
         
         await self.actor.init()
         await self.kettle.init()
+        await self.step.init()
         await self.call_initializer(self.app)
         await self.dashboard.init()
 

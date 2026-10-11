@@ -17,6 +17,18 @@ from cbpi.api.timer import Timer
 from voluptuous.schema_builder import message
 
 
+TIMER_RECOVERY_PROPERTIES = [
+    Property.Select(
+        "RecoveryMode", options=["Paused", "Automatic"], default_value="Paused",
+        description="Restore this step paused or continue automatically after restart",
+    ),
+    Property.Select(
+        "RecoveryDowntime", options=["No", "Yes"], default_value="No",
+        description="Count application downtime using the saved timer deadline",
+    ),
+]
+
+
 @parameters(
     [
         Property.Text(
@@ -188,16 +200,22 @@ class MashInStep(CBPiStep):
             options=["Yes", "No"],
             description="Switch Kettlelogic automatically on and off -> Yes",
         ),
-    ]
+    ] + TIMER_RECOVERY_PROPERTIES
 )
 class MashStep(CBPiStep):
 
+    timer_recovery = True
+
     @action("Start Timer", [])
     async def start_timer(self):
-        if self.timer.is_running is not True:
+        if not self.running or self.timer is None:
+            self.cbpi.notify(
+                self.name, "Step is paused. Press Start to continue.", NotificationType.WARNING
+            )
+            return
+        if not self.timer.running:
             self.cbpi.notify(self.name, "Timer started", NotificationType.INFO)
             self.timer.start()
-            self.timer.is_running = True
         else:
             self.cbpi.notify(
                 self.name, "Timer is already running", NotificationType.WARNING
@@ -205,7 +223,7 @@ class MashStep(CBPiStep):
 
     @action("Add 5 Minutes to Timer", [])
     async def add_timer(self):
-        if self.timer.is_running == True:
+        if self.timer.running:
             self.cbpi.notify(self.name, "5 Minutes added", NotificationType.INFO)
             await self.timer.add(300)
         else:
@@ -236,19 +254,11 @@ class MashStep(CBPiStep):
         await self.push_update()
 
         if self.cbpi.kettle is not None and self.timer is None:
-            self.timer = Timer(
-                int(self.props.get("Timer", 0)) * 60,
-                on_update=self.on_timer_update,
-                on_done=self.on_timer_done,
-            )
-        elif self.cbpi.kettle is not None:
-            try:
-                if self.timer.is_running == True:
-                    self.timer.start()
-            except:
-                pass
+            self.timer = self.create_timer()
 
-        self.summary = "Waiting for Target Temp"
+        self.summary = (
+            self.timer.get_time() if self.timer.started else "Waiting for Target Temp"
+        )
         await self.push_update()
 
     async def on_stop(self):
@@ -259,11 +269,8 @@ class MashStep(CBPiStep):
         await self.push_update()
 
     async def reset(self):
-        self.timer = Timer(
-            int(self.props.get("Timer", 0)) * 60,
-            on_update=self.on_timer_update,
-            on_done=self.on_timer_done,
-        )
+        self.recovery_state = None
+        self.timer = self.create_timer()
 
     async def run(self):
         while self.running == True:
@@ -273,12 +280,11 @@ class MashStep(CBPiStep):
             )
             if (
                 sensor_value >= int(self.props.get("Temp", 0))
-                and self.timer.is_running is not True
+                and not self.timer.running
             ):
                 self.timer.start()
-                self.timer.is_running = True
                 estimated_completion_time = datetime.fromtimestamp(
-                    time.time() + (int(self.props.get("Timer", 0))) * 60
+                    time.time() + self.timer.remaining()
                 )
                 self.cbpi.notify(
                     self.name,
@@ -307,8 +313,11 @@ class MashStep(CBPiStep):
 
 @parameters(
     [Property.Number(label="Timer", description="Time in Minutes", configurable=True)]
+    + TIMER_RECOVERY_PROPERTIES
 )
 class WaitStep(CBPiStep):
+
+    timer_recovery = True
 
     async def on_timer_done(self, timer):
         self.summary = ""
@@ -320,11 +329,7 @@ class WaitStep(CBPiStep):
 
     async def on_start(self):
         if self.timer is None:
-            self.timer = Timer(
-                int(self.props.Timer) * 60,
-                on_update=self.on_timer_update,
-                on_done=self.on_timer_done,
-            )
+            self.timer = self.create_timer()
         self.timer.start()
 
     async def on_stop(self):
@@ -333,11 +338,8 @@ class WaitStep(CBPiStep):
         await self.push_update()
 
     async def reset(self):
-        self.timer = Timer(
-            int(self.props.Timer) * 60,
-            on_update=self.on_timer_update,
-            on_done=self.on_timer_done,
-        )
+        self.recovery_state = None
+        self.timer = self.create_timer()
 
     async def run(self):
         while self.running == True:
@@ -401,9 +403,11 @@ class ToggleStep(CBPiStep):
             label="Timer", description="Time in Minutes", configurable=True
         ),
         Property.Actor(label="Actor"),
-    ]
+    ] + TIMER_RECOVERY_PROPERTIES
 )
 class ActorStep(CBPiStep):
+    timer_recovery = True
+
     async def on_timer_done(self, timer):
         self.summary = ""
         await self.next()
@@ -414,11 +418,7 @@ class ActorStep(CBPiStep):
 
     async def on_start(self):
         if self.timer is None:
-            self.timer = Timer(
-                int(self.props.Timer) * 60,
-                on_update=self.on_timer_update,
-                on_done=self.on_timer_done,
-            )
+            self.timer = self.create_timer()
         self.timer.start()
         await self.actor_on(self.props.Actor)
 
@@ -429,11 +429,8 @@ class ActorStep(CBPiStep):
         await self.push_update()
 
     async def reset(self):
-        self.timer = Timer(
-            int(self.props.Timer) * 60,
-            on_update=self.on_timer_update,
-            on_done=self.on_timer_done,
-        )
+        self.recovery_state = None
+        self.timer = self.create_timer()
 
     async def run(self):
         while self.running == True:
@@ -521,16 +518,67 @@ class ActorStep(CBPiStep):
         Property.Text(
             "Hop_6_text", configurable=True, description="Sixth Hop alert text"
         ),
-    ]
+    ] + TIMER_RECOVERY_PROPERTIES
 )
 class BoilStep(CBPiStep):
 
+    timer_recovery = True
+
+    def restore_timer_state(self, state, count_downtime=False, keep_deadline=False):
+        hops = state.get("hops_added", [False] * 6) if isinstance(state, dict) else None
+        if (
+            not isinstance(hops, list) or len(hops) != 6
+            or any(not isinstance(flag, bool) for flag in hops)
+            or not isinstance(state.get("first_wort_hop_flag", False), bool)
+        ):
+            raise ValueError("Invalid saved hop notification state")
+        super().restore_timer_state(state, count_downtime, keep_deadline)
+
+    async def on_recovery(self):
+        if not self.timer.started:
+            return
+        self.hops_added = self.recovery_state.get("hops_added", [False] * 6)
+        remaining = self.timer.remaining()
+        changed = False
+        for number in range(1, 7):
+            value = self.props.get("Hop_%s" % number)
+            if value is not None and value != "":
+                threshold = int(value) * 60
+                if remaining <= threshold and not self.hops_added[number - 1]:
+                    text = self.props.get("Hop_%s_text" % number) or "Hop %s" % number
+                    self.cbpi.notify(
+                        "Overdue Hop Alert",
+                        "Hop addition due during inactivity: %s" % text,
+                        NotificationType.WARNING,
+                    )
+                    self.hops_added[number - 1] = True
+                    changed = True
+        self.recovery_state["hops_added"] = self.hops_added
+        if changed:
+            await self.save_props()
+
+    def get_timer_state(self):
+        state = super().get_timer_state()
+        if state is not None:
+            state["hops_added"] = getattr(
+                self, "hops_added", (self.recovery_state or {}).get("hops_added", [False] * 6)
+            )
+            state["first_wort_hop_flag"] = getattr(
+                self, "first_wort_hop_flag",
+                (self.recovery_state or {}).get("first_wort_hop_flag", False),
+            )
+        return state
+
     @action("Start Timer", [])
     async def start_timer(self):
-        if self.timer.is_running is not True:
+        if not self.running or self.timer is None:
+            self.cbpi.notify(
+                self.name, "Step is paused. Press Start to continue.", NotificationType.WARNING
+            )
+            return
+        if not self.timer.running:
             self.cbpi.notify(self.name, "Timer started", NotificationType.INFO)
             self.timer.start()
-            self.timer.is_running = True
         else:
             self.cbpi.notify(
                 self.name, "Timer is already running", NotificationType.WARNING
@@ -538,7 +586,7 @@ class BoilStep(CBPiStep):
 
     @action("Add 5 Minutes to Timer", [])
     async def add_timer(self):
-        if self.timer.is_running == True:
+        if self.timer.running:
             self.cbpi.notify(self.name, "5 Minutes added", NotificationType.INFO)
             await self.timer.add(300)
         else:
@@ -569,11 +617,12 @@ class BoilStep(CBPiStep):
         self.AutoTimer = (
             True if self.cbpi.config.get("BoilAutoTimer", "No") == "Yes" else False
         )
-        self.first_wort_hop_flag = False
+        state = self.recovery_state or {}
+        self.first_wort_hop_flag = state.get("first_wort_hop_flag", False)
         self.first_wort_hop = self.props.get("First_Wort", "No")
         self.first_wort_hop_text = self.props.get("First_Wort_text", None)
-        self.hops_added = ["", "", "", "", "", ""]
-        self.remaining_seconds = None
+        self.hops_added = state.get("hops_added", [False] * 6)
+        self.remaining_seconds = self.timer.remaining() if self.timer is not None else None
         self.temparray = np.array([])
         # self.dwelltime=int(self.props.get("DwellTime", 0))*60
         self.dwelltime = (
@@ -588,27 +637,18 @@ class BoilStep(CBPiStep):
             self.kettle.target_temp = float(self.props.get("Temp", 0))
 
         if self.cbpi.kettle is not None and self.timer is None:
-            self.timer = Timer(
-                int(self.props.get("Timer", 0)) * 60,
-                on_update=self.on_timer_update,
-                on_done=self.on_timer_done,
-            )
+            self.timer = self.create_timer()
 
-        elif self.cbpi.kettle is not None:
-            try:
-                if self.timer.is_running == True:
-                    self.timer.start()
-            except:
-                pass
-
-        self.summary = "Waiting for Target Temp"
+        self.summary = (
+            self.timer.get_time() if self.timer.started else "Waiting for Target Temp"
+        )
         if self.AutoMode == True:
             await self.setAutoMode(True)
         await self.push_update()
 
     async def next_hop_timer(self):
         hop_timers = []
-        for x in range(1, 6):
+        for x in range(1, 7):
             try:
                 hop = int(self.props.get("Hop_%s" % x, None)) * 60
             except:
@@ -639,6 +679,7 @@ class BoilStep(CBPiStep):
                     self.cbpi.notify(
                         "Hop Alert", "Please add Hop %s" % number, NotificationType.INFO
                     )
+                await self.save_props()
 
     async def on_stop(self):
         await self.timer.stop()
@@ -655,11 +696,8 @@ class BoilStep(CBPiStep):
         await self.push_update()
 
     async def reset(self):
-        self.timer = Timer(
-            int(self.props.get("Timer", 0)) * 60,
-            on_update=self.on_timer_update,
-            on_done=self.on_timer_done,
-        )
+        self.recovery_state = None
+        self.timer = self.create_timer()
 
     async def run(self):
         if self.first_wort_hop_flag == False and self.first_wort_hop == "Yes":
@@ -676,6 +714,7 @@ class BoilStep(CBPiStep):
                     "Please add hops for first wort",
                     NotificationType.INFO,
                 )
+            await self.save_props()
 
         while self.running == True:
             await asyncio.sleep(1)
@@ -690,12 +729,11 @@ class BoilStep(CBPiStep):
                     (sensor_value >= self.lid_temp)
                     and (deviation <= self.deviationlimit)
                     and (self.AutoTimer is True)
-                    and (self.timer.is_running is not True)
+                    and (not self.timer.running)
                 ):
                     self.timer.start()
-                    self.timer.is_running = True
                     estimated_completion_time = datetime.fromtimestamp(
-                        time.time() + (int(self.props.get("Timer", 0))) * 60
+                        time.time() + self.timer.remaining()
                     )
                     self.cbpi.notify(
                         self.name,
@@ -721,12 +759,11 @@ class BoilStep(CBPiStep):
 
             if (
                 sensor_value >= float(self.props.get("Temp", 0))
-                and self.timer.is_running is not True
+                and not self.timer.running
             ):
                 self.timer.start()
-                self.timer.is_running = True
                 estimated_completion_time = datetime.fromtimestamp(
-                    time.time() + (int(self.props.get("Timer", 0))) * 60
+                    time.time() + self.timer.remaining()
                 )
                 self.cbpi.notify(
                     self.name,
@@ -736,7 +773,7 @@ class BoilStep(CBPiStep):
                     NotificationType.INFO,
                 )
             else:
-                if self.timer.is_running:
+                if self.timer.running:
                     try:
                         nexthoptimer = await self.next_hop_timer()
                         self.summary2 = (
@@ -746,7 +783,7 @@ class BoilStep(CBPiStep):
                         )
                     except:
                         self.summary2 = None
-                for x in range(1, 6):
+                for x in range(1, 7):
                     await self.check_hop_timer(
                         x,
                         self.props.get("Hop_%s" % x, None),

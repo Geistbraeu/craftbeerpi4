@@ -1,11 +1,12 @@
 import asyncio
 import math
 import time
+import logging
 
 
 class Timer(object):
 
-    def __init__(self, timeout, on_done=None, on_update=None) -> None:
+    def __init__(self, timeout, on_done=None, on_update=None, on_change=None) -> None:
         super().__init__()
         self.timeout = timeout
         self._timemout = self.timeout
@@ -14,56 +15,129 @@ class Timer(object):
         self._update = on_update
         self.start_time = None
         self.end_time = None
+        self.started = False
+        self._on_change = on_change
+        self._restored_end_time = None
+
+    @property
+    def running(self):
+        return self._task is not None and not self._task.done()
+
+    def remaining(self):
+        if self._restored_end_time is not None:
+            return max(0, int(self._restored_end_time) - int(time.time()))
+        if self.running and self.end_time is not None:
+            return max(0, self.end_time - int(time.time()))
+        return max(0, int(round(self._timemout)))
+
+    def snapshot(self):
+        return dict(
+            started=self.started,
+            remaining_seconds=self.remaining(),
+            end_time=self.end_time if self.running else self._restored_end_time,
+            saved_at=int(time.time()),
+        )
+
+    def restore(self, state, count_downtime=False, keep_deadline=False):
+        if self.running:
+            raise RuntimeError("Cannot restore a running timer")
+        self._restored_end_time = None
+        self.end_time = None
+        self.started = state["started"]
+        self._timemout = state["remaining_seconds"]
+        deadline = state.get("end_time")
+        if count_downtime and self.started and deadline is not None:
+            self._timemout = max(0, deadline - int(time.time()))
+            if keep_deadline:
+                self._restored_end_time = deadline
+
+    async def changed(self):
+        if self._on_change is not None:
+            try:
+                await self._on_change()
+            except OSError:
+                logging.exception("Timer checkpoint failed; countdown continues")
 
     def done(self, task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logging.error("Timer failed", exc_info=(type(error), error, error.__traceback__))
+            return
         if self._callback is not None:
             asyncio.create_task(self._callback(self))
 
     async def _job(self):
-        self.start_time = int(time.time())
-        self.end_time = self.start_time + int(round(self._timemout, 0))
-        self.count = self.end_time - self.start_time
+        self.count = max(0, self.end_time - self.start_time)
         try:
+            await self.changed()
             while self.count > 0:
-                self.count = self.end_time - int(time.time())
+                self.count = max(0, self.end_time - int(time.time()))
                 if self._update is not None:
                     await self._update(self, self.count)
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            end = int(time.time())
-            duration = end - self.start_time
-            self._timemout = self._timemout - duration
+                if self.count > 0:
+                    await asyncio.sleep(1)
+        finally:
+            self._timemout = max(0, self.end_time - int(time.time()))
 
     async def add(self, seconds):
-        self.end_time = self.end_time + seconds
+        if self.running and self.end_time is not None:
+            self.end_time = max(int(time.time()), self.end_time + seconds)
+        else:
+            self._timemout = max(0, self._timemout + seconds)
+            if self._restored_end_time is not None:
+                self._restored_end_time += seconds
+        await self.changed()
 
     def start(self):
+        if self.running:
+            return
+        self.start_time = int(time.time())
+        self.end_time = (
+            self._restored_end_time
+            if self._restored_end_time is not None
+            else self.start_time + int(round(self._timemout, 0))
+        )
+        self._restored_end_time = None
+        self.started = True
         self._task = asyncio.create_task(self._job())
         self._task.add_done_callback(self.done)
 
     async def stop(self):
+        if self._restored_end_time is not None:
+            self._timemout = self.remaining()
+            self._restored_end_time = None
         if self._task and self._task.done() is False:
             self._task.cancel()
-            await self._task
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._timemout = max(0, self.end_time - int(time.time()))
 
     def reset(self):
-        if self.is_running is True:
+        if self.running:
             return
         self._timemout = self.timeout
+        self.started = False
+        self._restored_end_time = None
 
     def is_running(self):
-        return not self._task.done()
+        return self.running
 
     def set_time(self, timeout):
-        if self.is_running is True:
+        if self.running:
             return
         self.timeout = timeout
+        self._timemout = timeout
 
     def get_time(self):
-        return self.format_time(int(round(self._timemout, 0)))
+        return self.format_time(self.remaining())
 
     @classmethod
     def format_time(cls, time):
+        time = max(0, time)
         pattern_h = "{0:02d}:{1:02d}:{2:02d}"
         pattern_d = "{0:02d}D {1:02d}:{2:02d}:{3:02d}"
         seconds = time % 60
