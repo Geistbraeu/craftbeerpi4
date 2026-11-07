@@ -62,6 +62,8 @@ starting a paused timer or changing the recipe duration. Subtraction clamps at
 zero; negative or non-finite input is rejected. Changes are saved immediately.
 An active countdown reaching zero completes normally; a paused step with zero
 remaining time finishes only after Start is pressed.
+The server publishes these actions in the order Start, Add 5 Minutes,
+Subtract 5 Minutes, Set Remaining Time.
 
 ## 🧑‍🤝‍🧑 Contribute
 You want to help develop CraftBeerPi4? To get you quickly stated, this repository comes with a preconfigured

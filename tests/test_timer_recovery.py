@@ -143,6 +143,10 @@ class StepRecoveryTests(unittest.IsolatedAsyncioTestCase):
         parser = PluginController(self.cbpi)
         for cls in (MashStep, BoilStep):
             actions = parser._parse_step_props(cls, cls.__name__)["actions"]
+            self.assertEqual(
+                [action["method"] for action in actions],
+                ["start_timer", "add_timer", "subtract_timer", "set_remaining_timer"],
+            )
             methods = {action["method"]: action for action in actions}
             self.assertIn("subtract_timer", methods)
             self.assertEqual(methods["set_remaining_timer"]["parameters"][0]["label"], "minutes")
